@@ -3,7 +3,9 @@
 import asyncio
 import fnmatch
 import logging
+import os
 import re
+import signal
 from collections.abc import Callable
 
 from . import abbreviation_import
@@ -357,7 +359,10 @@ class Decoder:
         got_output = False
 
         self._process = await asyncio.create_subprocess_shell(
-            self.command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            self.command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,  # own process group: shell + rtl_fm + multimon-ng
         )
 
         logger.debug("Decoder subprocess started, reading output...")
@@ -396,15 +401,13 @@ class Decoder:
         finally:
             if not stderr_task.done():
                 stderr_task.cancel()
-            # Make sure the pipeline is really dead before a possible restart
-            if self._process and self._process.returncode is None:
+            # Make sure the whole pipeline is really dead before a possible restart
+            proc = self._process
+            if proc and proc.returncode is None:
                 try:
-                    self._process.kill()
-                    await self._process.wait()
-                except ProcessLookupError:
-                    pass
+                    await self._stop_process(proc)
                 except Exception as e:
-                    logger.debug(f"Error killing decoder process: {e}")
+                    logger.debug(f"Error stopping decoder process: {e}")
             self._process = None
 
         return got_output
@@ -587,6 +590,23 @@ class Decoder:
             f"Reloaded {len(self._ignore_text)} ignore-text pattern(s), {len(self._ignore_capcodes)} ignored capcode(s)"
         )
 
+    def _signal_group(self, process: asyncio.subprocess.Process, sig: int) -> None:
+        """Send a signal to the whole pipeline (process group)."""
+        try:
+            os.killpg(process.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    async def _stop_process(self, process: asyncio.subprocess.Process) -> None:
+        """Stop shell + rtl_fm + multimon-ng gracefully, force kill if needed."""
+        self._signal_group(process, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3.0)
+        except TimeoutError:
+            logger.warning("Process not responding, force killing...")
+            self._signal_group(process, signal.SIGKILL)
+            await asyncio.wait_for(process.wait(), timeout=3.0)
+
     async def stop(self) -> None:
         """Stop the decoder subprocess."""
         self._running = False
@@ -599,15 +619,7 @@ class Decoder:
 
         if self._process:
             try:
-                # First try graceful termination
-                self._process.terminate()
-                try:
-                    await asyncio.wait_for(self._process.wait(), timeout=2.0)
-                except TimeoutError:
-                    # Force kill if not responding
-                    logger.warning("Process not responding, force killing...")
-                    self._process.kill()
-                    await asyncio.wait_for(self._process.wait(), timeout=3.0)
+                await self._stop_process(self._process)
             except Exception as e:
                 logger.error(f"Error stopping process: {e}")
             finally:
